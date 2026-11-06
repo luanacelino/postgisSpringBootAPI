@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Mapa - Consultas espaciais</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <style>
+    body { margin: 0; font-family: Arial, sans-serif; }
+    #barra { padding: 10px; background: #1f3a5f; color: #fff; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    #barra select, #barra button { padding: 6px 10px; }
+    #barra button { cursor: pointer; }
+    #barra a { color: #cfe3ff; margin-left: auto; }
+    #msg { font-size: 14px; }
+    .campo { position: relative; }
+    .campo input { padding: 6px; width: 230px; box-sizing: border-box; }
+    .sug { display: none; position: absolute; top: 100%; left: 0; right: 0; z-index: 2000; background: #fff; color: #222;
+           border: 1px solid #b8c4d4; border-top: none; max-height: 260px; overflow-y: auto; box-shadow: 0 4px 10px rgba(0,0,0,.25); }
+    .sug div { padding: 7px 10px; cursor: pointer; font-size: 14px; display: flex; justify-content: space-between; gap: 10px; }
+    .sug div small { color: #6b7a8c; }
+    .sug div.ativo, .sug div:hover { background: #dce8f7; }
+    .sug div.erro { color: #b00020; cursor: default; background: #fff3f3; }
+    #info { padding: 6px 12px; background: #eef3f9; color: #1f3a5f; font-size: 14px; border-bottom: 1px solid #c9d6e6; }
+    #mapa { height: calc(100vh - 92px); }
+  </style>
+</head>
+<body>
+  <div id="barra">
+    <select id="consulta"></select>
+    <div class="campo"><input id="v0" autocomplete="off"><div class="sug" id="s0"></div></div>
+    <div class="campo"><input id="v1" autocomplete="off"><div class="sug" id="s1"></div></div>
+    <button onclick="desenhar()">Desenhar</button>
+    <span id="msg"></span>
+    <a href="/swagger-ui/index.html">Swagger</a>
+  </div>
+  <div id="info"></div>
+  <div id="mapa"></div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    const UFS = ['AC','AL','AP','AM','BA','CE','DF','ES','GO','MA','MT','MS','MG','PA','PB','PR','PE','PI','RJ','RN','RS','RO','RR','SC','SP','SE','TO'];
+
+    // de onde vêm as sugestões de cada tipo de campo:
+    //   url   = endpoint que busca no banco enquanto você digita
+    //   todos = a lista é pequena, carrega inteira de uma vez
+    //   fixo  = lista pronta aqui mesmo
+    const CAMPOS = {
+      municipio:  { label: 'Município (digite para ver sugestões)', url: '/sugestoes/municipios' },
+      municipio2: { label: 'Segundo município', url: '/sugestoes/municipios' },
+      aeroporto:  { label: 'Aeroporto (clique para ver os disponíveis)', url: '/sugestoes/aeroportos', listar: true },
+      porto:      { label: 'Porto (clique para ver os disponíveis)', url: '/sugestoes/portos', listar: true },
+      ferrovia:   { label: 'Ferrovia (clique para ver as disponíveis)', url: '/sugestoes/ferrovias', listar: true },
+      tipo:       { label: 'Tipo de rodovia', url: '/sugestoes/tiposRodovia', todos: true, padrao: 'Pavimentada' },
+      uf:         { label: 'UF (ex.: PB)', fixo: UFS },
+      br:         { label: 'Rodovia - BR (clique para ver as disponíveis)', url: '/sugestoes/rodovias', listar: true },
+      km:         { label: 'Raio em km', padrao: '100' }
+    };
+
+    const CONSULTAS = [
+      { contexto: true, nome: 'Municípios vizinhos', fn: 'touches', campos: ['municipio'],
+        desc: 'Municípios que fazem divisa com o município escolhido.',
+        url: e => `/municipiosVizinhos/${e[0]}` },
+      { nome: 'Distância entre municípios', fn: 'distance', campos: ['municipio', 'municipio2'],
+        desc: 'Desenha os dois municípios e a menor linha entre eles, com a distância.',
+        url: e => `/tracadoMunicipios/${e[0]}/${e[1]}` },
+      { contexto: true, nome: 'Aeroportos do município', fn: 'within', campos: ['aeroporto'],
+        desc: 'Aeroportos que estão dentro do município (a lista mostra os municípios que têm aeroporto).',
+        url: e => `/aeroportosDoMunicipio/${e[0]}` },
+      { nome: 'Distância município → aeroporto', fn: 'distance', campos: ['municipio', 'aeroporto'],
+        desc: 'Desenha o município, o aeroporto e a menor linha entre eles, com a distância.',
+        url: e => `/tracadoMunicipioAeroporto/${e[0]}/${e[1]}` },
+      { contexto: true, nome: 'Portos próximos', fn: 'distance', campos: ['porto', 'km'],
+        desc: 'Portos dentro do raio informado (em km), medido a partir da borda do município do porto escolhido. O próprio porto escolhido também aparece.',
+        url: e => `/portosProximos/${e[0]}?km=${e[1]}` },
+      { nome: 'Portos por UF', fn: 'contains', campos: ['uf'],
+        desc: 'Portos que estão dentro dos municípios de uma UF.',
+        url: e => `/portosPorUf/${e[0]}` },
+      { contexto: true, nome: 'Ferrovias do município', fn: 'intersects', campos: ['municipio'],
+        desc: 'Trechos de ferrovia que passam pelo município.',
+        url: e => `/ferroviasDoMunicipio/${e[0]}` },
+      { nome: 'Municípios da ferrovia', fn: 'intersects', campos: ['ferrovia'],
+        desc: 'Municípios por onde passa a ferrovia escolhida.',
+        url: e => `/municipiosDaFerrovia/${e[0]}` },
+      { contexto: true, nome: 'Rodovias do município', fn: 'intersects', campos: ['municipio', 'tipo'],
+        desc: 'Trechos de rodovia de um tipo que passam pelo município.',
+        url: e => `/rodoviasDoMunicipio/${e[0]}?tipo=${e[1]}` },
+      { nome: 'Municípios da rodovia (BR)', fn: 'intersects', campos: ['br'],
+        desc: 'Municípios cortados por uma BR.',
+        url: e => `/municipiosDaRodovia/${e[0]}` }
+    ];
+
+    // ---------- mapa (OpenStreetMap) ----------
+    const mapa = L.map('mapa').setView([-14.2, -51.9], 4);
+    L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 19,
+      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+    }).addTo(mapa);
+    let camada = null;
+
+    // ---------- campos + sugestões (lista própria, estilo Google) ----------
+    const selConsulta = document.getElementById('consulta');
+    const entradas = [document.getElementById('v0'), document.getElementById('v1')];
+    const caixas = [document.getElementById('s0'), document.getElementById('s1')];
+    const estado = [0, 1].map(() => ({ itens: [], ativo: -1, locais: null, timer: null, seq: 0, selecionado: null }));
+
+    CONSULTAS.forEach((c, i) => selConsulta.add(new Option('Consulta ' + (i + 1) + ' - ' + c.nome, i)));
+    selConsulta.addEventListener('change', () => {
+      configurar();
+      // ao trocar de consulta, limpa o mapa e a mensagem da consulta anterior (evita mostrar resultado antigo)
+      if (camada) { mapa.removeLayer(camada); camada = null; }
+      document.getElementById('msg').textContent = '';
+    });
+
+    function fechar(i) { caixas[i].style.display = 'none'; estado[i].ativo = -1; }
+
+    function mostrar(i, itens, erro) {
+      const cx = caixas[i], st = estado[i];
+      cx.innerHTML = '';
+      st.itens = itens; st.ativo = -1;
+      if (erro) {
+        const d = document.createElement('div'); d.className = 'erro'; d.textContent = erro; cx.appendChild(d);
+      } else {
+        itens.forEach((it, k) => {
+          const d = document.createElement('div');
+          d.innerHTML = '<span></span><small></small>';
+          d.children[0].textContent = it.valor;
+          d.children[1].textContent = it.rotulo || '';
+          d.addEventListener('mousedown', ev => { ev.preventDefault(); escolher(i, k); });   // mousedown: antes do blur
+          cx.appendChild(d);
+        });
+      }
+      cx.style.display = (itens.length || erro) ? 'block' : 'none';
+    }
+
+    function escolher(i, k) {
+      const item = estado[i].itens[k];
+      entradas[i].value = item.valor;
+      estado[i].selecionado = item;
+      fechar(i);
+    }
+
+    function normalizar(lista) {
+      return lista.map(d => typeof d === 'string' ? { valor: d, rotulo: '', codigo: null } : { valor: d.nome, rotulo: d.sigla, codigo: d.codigo });
+    }
+
+    function filtrarLocais(i) {
+      const t = entradas[i].value.trim().toLowerCase();
+      const itens = (estado[i].locais || []).filter(it => it.valor.toLowerCase().startsWith(t)).slice(0, 15);
+      mostrar(i, itens);
+    }
+
+    async function buscar(i, campo, texto) {
+      const st = estado[i], minha = ++st.seq;
+      try {
+        const resp = await fetch(campo.url + '?q=' + encodeURIComponent(texto));
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        const dados = normalizar(await resp.json());
+        if (minha !== st.seq) return;                       // resposta antiga: ignora
+        mostrar(i, dados);
+      } catch (e) {
+        if (minha !== st.seq) return;
+        mostrar(i, [], 'Não consegui buscar sugestões (' + e.message + ')');
+      }
+    }
+
+    function aoDigitar(i) {
+      const consulta = CONSULTAS[selConsulta.value];
+      const campo = CAMPOS[consulta.campos[i]];
+      if (!campo) return;
+      if (campo.fixo || campo.todos) { filtrarLocais(i); return; }
+      if (!campo.url) return;
+      clearTimeout(estado[i].timer);
+      const texto = entradas[i].value.trim();
+      if (!texto) { if (campo.listar) buscar(i, campo, ''); else fechar(i); return; }
+      estado[i].timer = setTimeout(() => buscar(i, campo, texto), 200);
+    }
+
+    function configurar(inicial) {
+      const consulta = CONSULTAS[selConsulta.value];
+      document.getElementById('info').innerHTML = '<b>' + consulta.nome + '</b> (função espacial: <code>' + consulta.fn + '</code>) - ' + consulta.desc + ' <small style="color:#8a8a8a">[página v3]</small>';
+      entradas.forEach((inp, i) => {
+        const nomeCampo = consulta.campos[i];
+        const box = inp.parentElement;
+        box.style.display = nomeCampo ? '' : 'none';
+        fechar(i);
+        estado[i].locais = null;
+        estado[i].selecionado = null;
+        if (!nomeCampo) { inp.value = ''; return; }
+        const campo = CAMPOS[nomeCampo];
+        inp.placeholder = campo.label;
+        inp.value = campo.padrao || '';
+        if (campo.fixo) estado[i].locais = normalizar(campo.fixo);
+        if (campo.todos) {
+          fetch(campo.url + '?q=').then(r => r.json()).then(d => { estado[i].locais = normalizar(d); })
+            .catch(() => { estado[i].locais = []; });
+        }
+      });
+      if (inicial) entradas[0].value = 'Guarabira';
+    }
+
+    entradas.forEach((inp, i) => {
+      inp.addEventListener('input', () => { estado[i].selecionado = null; aoDigitar(i); });
+      inp.addEventListener('focus', () => {
+        const campo = CAMPOS[CONSULTAS[selConsulta.value].campos[i]];
+        if (!campo) return;
+        if (campo.fixo || campo.todos) filtrarLocais(i);                          // UF e tipo: mostra a lista ao clicar
+        else if (campo.listar && !entradas[i].value.trim()) buscar(i, campo, '');   // aeroporto, porto, ferrovia, BR: lista os disponíveis
+      });
+      inp.addEventListener('blur', () => setTimeout(() => fechar(i), 120));
+      inp.addEventListener('keydown', e => {
+        const st = estado[i], aberto = caixas[i].style.display === 'block' && st.itens.length;
+        if (e.key === 'ArrowDown' && aberto) { e.preventDefault(); st.ativo = (st.ativo + 1) % st.itens.length; marcar(i); }
+        else if (e.key === 'ArrowUp' && aberto) { e.preventDefault(); st.ativo = (st.ativo - 1 + st.itens.length) % st.itens.length; marcar(i); }
+        else if (e.key === 'Enter') { if (aberto && st.ativo >= 0) { e.preventDefault(); escolher(i, st.ativo); } else { fechar(i); desenhar(); } }
+        else if (e.key === 'Escape') { fechar(i); }
+      });
+    });
+
+    function marcar(i) {
+      [...caixas[i].children].forEach((d, k) => d.classList.toggle('ativo', k === estado[i].ativo));
+      const a = caixas[i].children[estado[i].ativo]; if (a && a.scrollIntoView) a.scrollIntoView({ block: 'nearest' });
+    }
+
+    // ---------- desenhar ----------
+    let motivoSemContorno = '';
+    async function buscarContexto(codigo) {
+      motivoSemContorno = '';
+      try {
+        const r = await fetch('/contexto/municipio/' + encodeURIComponent(codigo), { cache: 'no-store' });
+        if (!r.ok) { motivoSemContorno = 'o servidor respondeu HTTP ' + r.status; return null; }
+        return await r.json();
+      } catch (e) { motivoSemContorno = e.message; return null; }   // null = não veio o contorno
+    }
+
+    function formatarDistancia(m) {
+      return m >= 1000 ? (m / 1000).toLocaleString('pt-BR', { maximumFractionDigits: 1 }) + ' km'
+                       : Math.round(m).toLocaleString('pt-BR') + ' m';
+    }
+
+    // distância: lugar de origem (azul), lugar de destino (verde) e a menor linha entre eles (vermelha)
+    function desenharTracado(t) {
+      if (camada) mapa.removeLayer(camada);
+      camada = L.featureGroup();
+      L.geoJSON(t.geometriaOrigem, { style: { color: '#1f77b4', weight: 2, fillOpacity: 0.3 } })
+        .bindPopup('<b>Origem:</b> ' + t.origem).addTo(camada);
+      L.geoJSON(t.geometriaDestino, { style: { color: '#2e8b57', weight: 2, fillOpacity: 0.3 } })
+        .bindPopup('<b>Destino:</b> ' + t.destino).addTo(camada);
+      L.geoJSON(t.linha, { style: { color: '#c0392b', weight: 4, dashArray: '8 8' } })
+        .bindTooltip(formatarDistancia(t.metros), { permanent: true, direction: 'center' }).addTo(camada);
+      camada.addTo(mapa);
+      mapa.fitBounds(camada.getBounds(), { maxZoom: 12, padding: [40, 40] });
+      return t.origem + ' → ' + t.destino + ': ' + formatarDistancia(t.metros);
+    }
+
+    function popup(item) {
+      return Object.entries(item)
+        .filter(([k, v]) => k !== 'geometria' && v !== null)
+        .map(([k, v]) => '<b>' + k + ':</b> ' + v).join('<br>');
+    }
+
+    async function desenhar() {
+      const msg = document.getElementById('msg');
+      const consulta = CONSULTAS[selConsulta.value];
+      const valores = consulta.campos.map((tipo, i) => {
+        const item = estado[i].selecionado;
+        const exigeCodigo = ['municipio', 'municipio2', 'aeroporto', 'porto'].includes(tipo);
+        return exigeCodigo ? (item && item.codigo ? item.codigo : '') : entradas[i].value.trim();
+      });
+      if (valores.some(v => !v)) { msg.textContent = 'Selecione um município/aeroporto/porto na lista de sugestões (não basta apenas digitar o nome).'; return; }
+      msg.textContent = 'Buscando...';
+      try {
+        const resp = await fetch(consulta.url(valores.map(encodeURIComponent)));
+        if (resp.status === 404 && consulta.url(['x', 'x']).startsWith('/tracado')) {
+          const corpo = await resp.text();   // 404 do Spring (endpoint inexistente) vem com JSON de erro; "lugar não achado" vem vazio
+          throw new Error(corpo.includes('"path"') ? 'o servidor não tem esse endpoint (copie o TracadoController e reinicie)' : 'não encontrei esses lugares');
+        }
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        const dados = await resp.json();
+
+        if (dados && dados.linha) { msg.textContent = desenharTracado(dados); return; }
+        if (!Array.isArray(dados)) {              // consulta que devolve só um número (metros)
+          if (camada) { mapa.removeLayer(camada); camada = null; }   // limpa o desenho antigo
+          msg.textContent = 'Distância: ' + Number(dados).toLocaleString('pt-BR', { maximumFractionDigits: 0 }) + ' m';
+          return;
+        }
+        const ctxBruto = consulta.contexto ? await buscarContexto(valores[0]) : [];
+        const ctx = ctxBruto || [];
+        if (consulta.contexto && ctxBruto && ctxBruto.length === 0) motivoSemContorno = 'o servidor devolveu o contorno vazio para o código ' + valores[0];
+        const semContorno = consulta.contexto && (ctxBruto === null || ctx.length === 0);   // avisa na barra em vez de falhar em silêncio
+        if (camada) mapa.removeLayer(camada);
+        camada = L.featureGroup();
+        // contorno do município consultado (azul, tracejado), por baixo dos resultados
+        ctx.filter(i => i.geometria).forEach(item => {
+          L.geoJSON(item.geometria, { style: { color: '#1f77b4', weight: 2, fillOpacity: 0.08, dashArray: '5 5' } })
+            .bindPopup('<b>Município consultado:</b> ' + item.nome).addTo(camada);
+        });
+        // resultados (vermelho); pontos viram bolinhas bem visíveis
+        dados.filter(i => i.geometria).forEach(item => {
+          L.geoJSON(item.geometria, {
+            style: { color: '#c0392b', weight: 3, fillOpacity: 0.25 },
+            pointToLayer: (f, latlng) => L.circleMarker(latlng, { radius: 8, color: '#7b1113', weight: 2, fillColor: '#e74c3c', fillOpacity: 0.9 })
+          }).bindPopup(popup(item)).addTo(camada);
+        });
+        camada.addTo(mapa);
+        if (camada.getLayers().length) mapa.fitBounds(camada.getBounds(), { maxZoom: 12, padding: [30, 30] });
+        msg.textContent = (dados.length ? dados.length + ' resultado(s)' : 'Nenhum resultado para essa consulta')
+          + (semContorno ? ' - ATENÇÃO: sem contorno do município (' + motivoSemContorno + '). Teste: /contexto/municipio/' + valores[0] : '');
+      } catch (e) {
+        msg.textContent = 'Erro: ' + e.message;
+      }
+    }
+
+    configurar(true);
+    desenhar();
+  </script>
+</body>
+</html>

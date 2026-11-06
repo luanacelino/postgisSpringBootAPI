@@ -1,0 +1,14 @@
+{
+  "configurations": [
+    {
+      "type": "java",
+      "name": "Spring Boot-MeuProjetoApplication<postgisSpringBootAPI>",
+      "request": "launch",
+      "cwd": "${workspaceFolder}",
+      "mainClass": "br.com.example.MeuProjetoApplication",
+      "projectName": "postgisSpringBootAPI",
+      "args": "",
+      "envFile": "${workspaceFolder}/.env"
+    }
+  ]
+}
